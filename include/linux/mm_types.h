@@ -192,6 +192,18 @@ struct page {
 		struct kmem_cache *slab_cache;	/* SL[AU]B: Pointer to slab */
 	};
 
+	/* TODO(mhalcrow): Hang something off private instead */
+#ifdef CONFIG_FS_VERITY
+	bool is_auth_pg;
+	bool is_root;
+	bool queued;
+	unsigned nr_auth_lvls;	/* When 0, there's just the root hash */
+	struct page *auth_pgs[64];	/* TODO: Dynamically allocate */
+	unsigned hash_nrs[64];	/* TODO: Dynamically allocate */
+	bool contents_hashed;
+	char contents_hash[32];	/* TODO: Dynamically allocate */
+#endif  /* CONFIG_FS_VERITY */
+
 #ifdef CONFIG_MEMCG
 	struct mem_cgroup *mem_cgroup;
 #endif

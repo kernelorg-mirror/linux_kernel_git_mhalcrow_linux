@@ -721,7 +721,7 @@ static void move_data_page(struct inode *inode, block_t bidx, int gc_type,
 {
 	struct page *page;
 
-	page = get_lock_data_page(inode, bidx, true);
+	page = get_lock_data_page(inode, bidx, true, NULL);
 	if (IS_ERR(page))
 		return;
 
@@ -842,7 +842,8 @@ next_step:
 				continue;
 
 			/* if encrypted inode, let's go phase 3 */
-			if (f2fs_encrypted_file(inode)) {
+			if (f2fs_encrypted_file(inode) ||
+			    f2fs_verity_file(inode)) {
 				add_gc_inode(gc_list, inode);
 				continue;
 			}
@@ -856,7 +857,7 @@ next_step:
 			start_bidx = start_bidx_of_node(nofs, inode);
 			data_page = get_read_data_page(inode,
 					start_bidx + ofs_in_node, REQ_RAHEAD,
-					true);
+					true, NULL);
 			up_write(&F2FS_I(inode)->dio_rwsem[WRITE]);
 			if (IS_ERR(data_page)) {
 				iput(inode);
@@ -890,7 +891,8 @@ next_step:
 
 			start_bidx = start_bidx_of_node(nofs, inode)
 								+ ofs_in_node;
-			if (f2fs_encrypted_file(inode))
+			if (f2fs_encrypted_file(inode) ||
+			    f2fs_verity_file(inode))
 				move_data_block(inode, start_bidx, segno, off);
 			else
 				move_data_page(inode, start_bidx, gc_type,

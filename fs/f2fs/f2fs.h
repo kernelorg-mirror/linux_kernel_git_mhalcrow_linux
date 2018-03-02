@@ -24,6 +24,7 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/quotaops.h>
+#include <linux/fsverity.h>
 #include <crypto/hash.h>
 
 #define __FS_HAS_ENCRYPTION IS_ENABLED(CONFIG_F2FS_FS_ENCRYPTION)
@@ -125,6 +126,7 @@ struct f2fs_mount_info {
 #define F2FS_FEATURE_FLEXIBLE_INLINE_XATTR	0x0040
 #define F2FS_FEATURE_QUOTA_INO		0x0080
 #define F2FS_FEATURE_INODE_CRTIME	0x0100
+#define F2FS_FEATURE_VERITY		0x0200
 
 #define F2FS_HAS_FEATURE(sb, mask)					\
 	((F2FS_SB(sb)->raw_super->feature & cpu_to_le32(mask)) != 0)
@@ -576,6 +578,8 @@ enum {
 #define FADVISE_ENCRYPT_BIT	0x04
 #define FADVISE_ENC_NAME_BIT	0x08
 #define FADVISE_KEEP_SIZE_BIT	0x10
+#define FADVISE_VERITY_BIT	0x20
+#define FADVISE_KEEP_VERITY_BIT	0x40
 
 #define file_is_cold(inode)	is_file(inode, FADVISE_COLD_BIT)
 #define file_wrong_pino(inode)	is_file(inode, FADVISE_LOST_PINO_BIT)
@@ -590,6 +594,10 @@ enum {
 #define file_set_enc_name(inode) set_file(inode, FADVISE_ENC_NAME_BIT)
 #define file_keep_isize(inode)	is_file(inode, FADVISE_KEEP_SIZE_BIT)
 #define file_set_keep_isize(inode) set_file(inode, FADVISE_KEEP_SIZE_BIT)
+#define file_is_verity(inode)	is_file(inode, FADVISE_VERITY_BIT)
+#define file_set_verity(inode)	set_file(inode, FADVISE_VERITY_BIT)
+#define file_is_keep_verity(inode)	is_file(inode, FADVISE_KEEP_VERITY_BIT)
+#define file_set_keep_verity(inode)	set_file(inode, FADVISE_KEEP_VERITY_BIT)
 
 #define DEF_DIR_LEVEL		0
 
@@ -2826,10 +2834,11 @@ int f2fs_get_block(struct dnode_of_data *dn, pgoff_t index);
 int f2fs_preallocate_blocks(struct kiocb *iocb, struct iov_iter *from);
 int f2fs_reserve_block(struct dnode_of_data *dn, pgoff_t index);
 struct page *get_read_data_page(struct inode *inode, pgoff_t index,
-			int op_flags, bool for_write);
+				int op_flags, bool for_write,
+				struct fsverity_bio_ctrl *ctrl);
 struct page *find_data_page(struct inode *inode, pgoff_t index);
 struct page *get_lock_data_page(struct inode *inode, pgoff_t index,
-			bool for_write);
+				bool for_write, struct fsverity_bio_ctrl *ctrl);
 struct page *get_new_data_page(struct inode *inode,
 			struct page *ipage, pgoff_t index, bool new_i_size);
 int do_write_data_page(struct f2fs_io_info *fio);
@@ -3172,9 +3181,58 @@ static inline bool f2fs_bio_encrypted(struct bio *bio)
 	return bio->bi_private != NULL;
 }
 
+static inline bool f2fs_bio_verity(struct bio *bio)
+{
+	return bio->bi_verity_ctrl != NULL;
+}
+
 static inline int f2fs_sb_has_crypto(struct super_block *sb)
 {
 	return F2FS_HAS_FEATURE(sb, F2FS_FEATURE_ENCRYPT);
+}
+
+static inline int f2fs_sb_has_verity(struct super_block *sb)
+{
+	return F2FS_HAS_FEATURE(sb, F2FS_FEATURE_VERITY);
+}
+
+/*
+ * fsverity support
+ */
+static inline int f2fs_verity_file(struct inode *inode)
+{
+	return file_is_verity(inode);
+}
+
+static inline int f2fs_set_verity_file(struct inode *inode,
+					int flag)
+{
+	if (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY))
+		filemap_write_and_wait(inode->i_mapping);
+	inode_lock(inode);
+	/* TODO(mhalcrow): Do this?
+	i_size_write(inode, fsverity_i_size(inode));
+	*/
+	file_set_verity(inode);
+	inode_unlock(inode);
+	f2fs_mark_inode_dirty_sync(inode, true);
+	return 0;
+}
+
+/**
+ * @inode:
+ * @index:
+ * @ctrl:	When not NULL, queues the bio rather than submitting
+ */
+static inline struct page *f2fs_read_file_page(struct inode *inode,
+					       pgoff_t index,
+					       struct fsverity_bio_ctrl *ctrl)
+{
+	if (f2fs_has_inline_data(inode)) {
+		WARN_ON(1);
+		return ERR_PTR(-EINVAL);
+	}
+	return get_lock_data_page(inode, index, false, ctrl);
 }
 
 static inline int f2fs_sb_mounted_blkzoned(struct super_block *sb)
@@ -3251,6 +3309,17 @@ static inline void set_opt_mode(struct f2fs_sb_info *sbi, unsigned int mt)
 static inline bool f2fs_may_encrypt(struct inode *inode)
 {
 #ifdef CONFIG_F2FS_FS_ENCRYPTION
+	umode_t mode = inode->i_mode;
+
+	return (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode));
+#else
+	return 0;
+#endif
+}
+
+static inline bool f2fs_may_verity(struct inode *inode)
+{
+#ifdef CONFIG_F2FS_FS_VERITY
 	umode_t mode = inode->i_mode;
 
 	return (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode));

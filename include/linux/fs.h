@@ -59,6 +59,8 @@ struct workqueue_struct;
 struct iov_iter;
 struct fscrypt_info;
 struct fscrypt_operations;
+struct fsverity_info;
+struct fsverity_operations;
 
 extern void __init inode_init(void);
 extern void __init inode_init_early(void);
@@ -669,6 +671,11 @@ struct inode {
 	struct fscrypt_info	*i_crypt_info;
 #endif
 
+#if IS_ENABLED(CONFIG_FS_VERITY)
+	struct fsverity_info	*i_verity_info;
+	/* TODO(mhalcrow): Not for upstream */
+	struct list_head	i_fsverity_list;	/* Not for upstream */
+#endif
 	void			*i_private; /* fs or device private pointer */
 } __randomize_layout;
 
@@ -1363,6 +1370,7 @@ struct super_block {
 	const struct xattr_handler **s_xattr;
 
 	const struct fscrypt_operations	*s_cop;
+	const struct fsverity_operations *s_vop;
 
 	struct hlist_bl_head	s_roots;	/* alternate root dentries for NFS */
 	struct list_head	s_mounts;	/* list of mounts; _not_ for fs use */
@@ -1446,6 +1454,12 @@ struct super_block {
 
 	spinlock_t		s_inode_wblist_lock;
 	struct list_head	s_inodes_wb;	/* writeback inodes */
+#ifdef CONFIG_FS_VERITY
+	/* TODO(mhalcrow): Not for upstream */
+	/* fs-verity inodes being pinned in memory */
+	spinlock_t		s_inode_fsveritylist_lock;
+	struct list_head	s_inodes_fsverity;
+#endif
 } __randomize_layout;
 
 /* Helper functions so that in most cases filesystems will
