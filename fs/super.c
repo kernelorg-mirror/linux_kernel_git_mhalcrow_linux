@@ -231,6 +231,11 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags,
 	spin_lock_init(&s->s_inode_list_lock);
 	INIT_LIST_HEAD(&s->s_inodes_wb);
 	spin_lock_init(&s->s_inode_wblist_lock);
+#ifdef CONFIG_FS_VERITY
+	/* TODO(mhalcrow): Not for upstream */
+	INIT_LIST_HEAD(&s->s_inodes_fsverity);
+	spin_lock_init(&s->s_inode_fsveritylist_lock);
+#endif
 
 	if (list_lru_init_memcg(&s->s_dentry_lru))
 		goto fail;
@@ -421,12 +426,34 @@ void generic_shutdown_super(struct super_block *sb)
 	const struct super_operations *sop = sb->s_op;
 
 	if (sb->s_root) {
+#ifdef CONFIG_FS_VERITY
+		struct inode *inode, *tmp;
+#endif
+
 		shrink_dcache_for_umount(sb);
 		sync_filesystem(sb);
 		sb->s_flags &= ~SB_ACTIVE;
 
 		fsnotify_unmount_inodes(sb);
 		cgroup_writeback_umount();
+
+#ifdef CONFIG_FS_VERITY
+		/* TODO(mhalcrow): Not for upstream (fsverity list on the sb) */
+		spin_lock(&sb->s_inode_fsveritylist_lock);
+		list_for_each_entry_safe(inode, tmp, &sb->s_inodes_fsverity,
+					 i_fsverity_list) {
+			spin_lock(&inode->i_lock);
+#ifdef CONFIG_FS_VERITY_DEBUG
+			printk(KERN_WARNING "%s: Deleting &inode->i_fsverity_"
+			       "list = [0x%p]\n", __func__,
+			       &inode->i_fsverity_list);
+#endif
+			list_del(&inode->i_fsverity_list);
+			spin_unlock(&inode->i_lock);
+			iput(inode);
+		}
+		spin_unlock(&sb->s_inode_fsveritylist_lock);
+#endif
 
 		evict_inodes(sb);
 

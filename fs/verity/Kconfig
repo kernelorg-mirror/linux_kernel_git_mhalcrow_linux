@@ -1,0 +1,11 @@
+config FS_VERITY
+	tristate "FS Verity (File-based authentication)"
+	select CRYPTO
+	select CRYPTO_CRC32
+	select CRYPTO_SHA256
+	select CRYPTO_HASH
+	help
+	  This option enables file-based verity feature.  The
+	  filesystem checks data blocks' authenticity when reading
+	  them from underlying disk, similar to how dm-verity does
+	  this when reading from a block device.

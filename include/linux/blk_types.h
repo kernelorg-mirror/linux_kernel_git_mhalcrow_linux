@@ -124,6 +124,11 @@ struct bio {
 	bio_end_io_t		*bi_end_io;
 
 	void			*bi_private;
+
+	/* TODO(mhalcrow): Fold into bi_private structure together w/ fscrypt */
+#if defined(CONFIG_FS_VERITY)
+	struct fsverity_bio_ctrl	*bi_verity_ctrl;
+#endif
 #ifdef CONFIG_BLK_CGROUP
 	/*
 	 * Optional ioc and css associated with this bio.  Put on bio
@@ -141,6 +146,11 @@ struct bio {
 		struct bio_integrity_payload *bi_integrity; /* data integrity */
 #endif
 	};
+
+	/* TODO(mhalcrow): Link together via bi_private structure? */
+#if defined(CONFIG_FS_VERITY)
+	struct list_head	bi_group;	/* bios completing together */
+#endif
 
 	unsigned short		bi_vcnt;	/* how many bio_vec's */
 
