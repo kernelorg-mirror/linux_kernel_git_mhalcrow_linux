@@ -76,7 +76,8 @@ static void f2fs_read_end_io(struct bio *bio)
 	if (f2fs_bio_verity(bio)) {
 		BUG_ON(f2fs_bio_encrypted(bio)); /* TODO(mhalcrow) */
 		if (bio->bi_status) {
-			/* TODO(mhalcrow) */
+			/* TODO(mhalcrow): Ensure we're doing
+			 * everything we should be doing */
 			fsverity_release_bio_ctrl(bio->bi_verity_ctrl);
 		} else {
 #ifdef CONFIG_FS_VERITY_DEBUG

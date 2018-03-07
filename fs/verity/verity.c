@@ -156,6 +156,7 @@ static int __measure_fs_verity_root_hash(
 				    "final returned [%d]\n", err);
 		goto out;
 	}
+	vi->root_hashed = true;
 #ifdef CONFIG_FS_VERITY_DEBUG
 	{
 		char computed_hex_hash[2 * SHA256_DIGEST_SIZE + 1];
@@ -238,8 +239,6 @@ static int __full_header_size(const char *hdr_virt)
 
 	header = (struct fsverity_header *)hdr_virt;
 	ext_pos = sizeof(struct fsverity_header);
-	if (!(le32_to_cpu(header->flags) & 1))	/* No extensions */
-		goto out;
 	extension_count = header->extension_count;
 	if (extension_count == 0) {
 		printk(KERN_WARNING "%s: Extension flag set, but extension "
@@ -489,8 +488,20 @@ static int __read_fsverity_header(struct inode *inode,
 	if (err) {
 		pr_warn_ratelimited("Error measuring fs-verity root hash: [%d]",
 				    err);
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING
+		       "%s: Setting &info->fail = [0x%p] to true\n",
+		       __func__, &info->fail);
+#endif
+		info->fail = true;
 		goto put_out;
 	}
+#ifdef CONFIG_FS_VERITY_DEBUG
+	printk(KERN_WARNING
+	       "%s: Setting &info->fail = [0x%p] to false\n",
+	       __func__, &info->fail);
+#endif
+	info->fail = false;
 put_out:
 	if (hdr_page) {
 		kunmap(hdr_page);
@@ -535,10 +546,24 @@ static int __get_info(struct inode *inode, struct fsverity_info *vi,
 #endif
 		return 0;
 	}
-	if (vi && inode->i_verity_info) {
+	if (vi && inode->i_verity_info && !root_hash) {
 #ifdef CONFIG_FS_VERITY_DEBUG
-		printk(KERN_WARNING "%s: vi && inode([0x%p])->i_verity_info, "
-		       "so skipping header read/verify\n", __func__, inode);
+		printk(KERN_WARNING
+		       "%s: Checking &inode->i_verity_info->fail = [0x%p]\n",
+		       __func__, &inode->i_verity_info->fail);
+#endif
+		if (inode->i_verity_info->fail) {
+#ifdef CONFIG_FS_VERITY_DEBUG
+			printk(KERN_WARNING
+			       "%s: verity file in failure state\n",
+			       __func__);
+#endif
+			return -EIO;
+		}
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING "%s: vi && inode([0x%p])->i_verity_info "
+		       "&& !root_hash, so skipping header read/verify\n",
+		       __func__, inode);
 #endif
 		return 0;
 	}
@@ -564,7 +589,12 @@ int fsverity_measure_info(struct inode *inode,
 			  const struct fsverity_root_hash *root_hash)
 {
 	struct fsverity_info info;
-	/* TODO(mhalcrow): Not for upstream (fsverity list on the sb) */
+	/* TODO(mhalcrow): The initial root hash validation mechanism
+	 * requires that userspace explicitly declare the root hash
+	 * via the MEASURE ioctl.  In the future, we're going to want
+	 * to have a signature attached to the files that we validate
+	 * whenever we load the authenticated data structure root into
+	 * memory. */
 	struct inode *sb_inode;
 	struct super_block *sb;
 	bool found = false;
@@ -605,9 +635,9 @@ int fsverity_get_info(struct inode *inode)
 	err = __get_info(inode, vi, NULL);
 	if (err)
 		goto free_out;
-
 	if (cmpxchg(&inode->i_verity_info, NULL, vi) == NULL)
 		vi = NULL;
+
 free_out:
 	__put_verity_info(vi);
 	return err;
@@ -1015,13 +1045,22 @@ static bool __verify_root_hash(struct page *page)
 	printk(KERN_WARNING "%s: page [0x%p] is the only data page in the "
 	       "file; checking against root hash\n", __func__, page);
 #endif
-	/* TODO(mhalcrow): Do this right.  For now we're going to rely
-	 * on pre-measure and superblock fs-verity inode pinning. */
+	/* TODO(mhalcrow): For now we're going to rely on pre-measure
+	 * and superblock fs-verity inode pinning. */
 	if (!vi->root_hashed) {
-		printk(KERN_WARNING "%s: TODO: Get trusted root hash\n",
+		printk(KERN_WARNING "%s: Merkle tree root hash untrusted.  "
+		       "Use the FS_IOC_MEASURE_FSVERITY ioctl to provide a "
+		       "trusted fs-verity root hash (which covers the "
+		       "header and the Merkle tree root hash).\n",
 		       __func__);
-		memcpy(vi->root_hash, page->contents_hash, SHA256_DIGEST_SIZE);
-		vi->root_hashed = true;
+		page->authenticated = false;
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING
+		       "%s: Setting &vi->fail = [0x%p] to true\n",
+		       __func__, &vi->fail);
+#endif
+		vi->fail = true;
+		return false;
 	}
 	page->authenticated = __are_hashes_equal(vi->root_hash,
 						 page->contents_hash);
@@ -1090,7 +1129,11 @@ static void __complete_bio_group(struct work_struct *work)
 				page->authenticated = false;
 				if (page->is_root &&
 				    !__verify_root_hash(page)) {
-					WARN_ON_ONCE(1);
+#ifdef CONFIG_FS_VERITY_DEBUG
+					printk(KERN_WARNING
+					       "%s: root hash not verified\n",
+					       __func__);
+#endif
 					status = BLK_STS_IOERR;
 					goto complete;
 				}

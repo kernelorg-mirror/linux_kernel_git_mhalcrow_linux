@@ -24,7 +24,7 @@ struct fsverity_header {
 	u8 log_arity;	/* log2(leaves-per-node) (E.g., 7 for SHA2 ) */
 	__le16 meta_algorithm;	/* Cryptographic digest for tree blocks */
 	__le16 data_algorithm;	/* Cryptographic digest for data blocks */
-	__le32 flags;	/* Only flag is '1' if there are fsverity_extensions */
+	__le32 flags;		/* No flags for now */
 	__le32 reserved1;	/* Must be 0 */
 	__le64 size;		/* Size of the original, unpadded data. */
 	/* The number of blocks from the start of this header where
@@ -86,6 +86,7 @@ struct fsverity_info {
 
 	bool root_hashed;
 	char root_hash[SHA256_DIGEST_SIZE];	/* Merkle tree root hash */
+	bool fail;		/* File authenticity check failed */
 
 	/* starting blocks for each tree level. 0 is the lowest level. */
 	sector_t hash_lvl_region_idx[FS_VERITY_MAX_LEVELS];
