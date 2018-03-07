@@ -13,6 +13,7 @@
 #include <linux/buffer_head.h>
 #include <linux/backing-dev.h>
 #include <linux/writeback.h>
+#include <linux/fsverity.h>
 
 #include "f2fs.h"
 #include "node.h"
@@ -586,6 +587,7 @@ no_delete:
 	}
 out_clear:
 	fscrypt_put_encryption_info(inode);
+	fsverity_put_info(inode);
 	clear_inode(inode);
 }
 

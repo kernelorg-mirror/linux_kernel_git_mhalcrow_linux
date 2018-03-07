@@ -23,6 +23,7 @@
 #include <linux/memcontrol.h>
 #include <linux/cleancache.h>
 #include <linux/sched/signal.h>
+#include <linux/list.h>
 
 #include "f2fs.h"
 #include "node.h"
@@ -63,10 +64,22 @@ static void f2fs_read_end_io(struct bio *bio)
 #endif
 
 	if (f2fs_bio_encrypted(bio)) {
+		BUG_ON(f2fs_bio_verity(bio)); /* TODO(mhalcrow): support this */
 		if (bio->bi_status) {
 			fscrypt_release_ctx(bio->bi_private);
 		} else {
 			fscrypt_decrypt_bio_pages(bio->bi_private, bio);
+			return;
+		}
+	}
+
+	if (f2fs_bio_verity(bio)) {
+		BUG_ON(f2fs_bio_encrypted(bio)); /* TODO(mhalcrow) */
+		if (bio->bi_status) {
+			/* TODO(mhalcrow) */
+			fsverity_release_bio_ctrl(bio->bi_verity_ctrl);
+		} else {
+			fsverity_verify_bio(bio);
 			return;
 		}
 	}
@@ -470,12 +483,14 @@ out_fail:
 }
 
 static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
-							 unsigned nr_pages)
+				      unsigned nr_pages,
+				      struct fsverity_bio_ctrl *ctrl)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
 	struct fscrypt_ctx *ctx = NULL;
 	struct bio *bio;
 
+	/* TODO(mhalcrow): Consolidate fscrypt and fsverity ctx */
 	if (f2fs_encrypted_file(inode)) {
 		ctx = fscrypt_get_ctx(inode, GFP_NOFS);
 		if (IS_ERR(ctx))
@@ -487,23 +502,43 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 
 	bio = f2fs_bio_alloc(sbi, min_t(int, nr_pages, BIO_MAX_PAGES), false);
 	if (!bio) {
-		if (ctx)
+		if (ctx) /* TODO: Fold into bio_ctx */
 			fscrypt_release_ctx(ctx);
 		return ERR_PTR(-ENOMEM);
 	}
 	f2fs_target_device(sbi, blkaddr, bio);
 	bio->bi_end_io = f2fs_read_end_io;
 	bio->bi_private = ctx;
+#ifdef CONFIG_F2FS_FS_VERITY
+	if (f2fs_verity_file(inode))
+		bio->bi_verity_ctrl = ctrl;
+#endif  /* CONFIG_F2FS_FS_VERITY */
 	bio_set_op_attrs(bio, REQ_OP_READ, 0);
 
 	return bio;
 }
 
+#ifdef CONFIG_F2FS_FS_VERITY
+static void __queue_or_submit_bio(struct inode *inode, struct bio *bio)
+{
+	if (f2fs_verity_file(inode) && bio->bi_verity_ctrl)
+		list_add_tail(&bio->bi_group, &bio->bi_verity_ctrl->bio_group);
+	else
+		__submit_bio(F2FS_I_SB(inode), bio, DATA);
+}
+#else
+static void __queue_or_submit_bio(struct inode *inode, struct bio *bio)
+{
+	__submit_bio(F2FS_I_SB(inode), bio, DATA);
+}
+#endif  /* CONFIG_F2FS_FS_VERITY */
+
 /* This can handle encryption stuffs */
 static int f2fs_submit_page_read(struct inode *inode, struct page *page,
-							block_t blkaddr)
+				 block_t blkaddr,
+				 struct fsverity_bio_ctrl *ctrl)
 {
-	struct bio *bio = f2fs_grab_read_bio(inode, blkaddr, 1);
+	struct bio *bio = f2fs_grab_read_bio(inode, blkaddr, 1, ctrl);
 
 	if (IS_ERR(bio))
 		return PTR_ERR(bio);
@@ -512,7 +547,7 @@ static int f2fs_submit_page_read(struct inode *inode, struct page *page,
 		bio_put(bio);
 		return -EFAULT;
 	}
-	__submit_bio(F2FS_I_SB(inode), bio, DATA);
+	__queue_or_submit_bio(inode, bio);
 	return 0;
 }
 
@@ -626,7 +661,8 @@ int f2fs_get_block(struct dnode_of_data *dn, pgoff_t index)
 }
 
 struct page *get_read_data_page(struct inode *inode, pgoff_t index,
-						int op_flags, bool for_write)
+				int op_flags, bool for_write,
+				struct fsverity_bio_ctrl *ctrl)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct dnode_of_data dn;
@@ -655,8 +691,19 @@ struct page *get_read_data_page(struct inode *inode, pgoff_t index,
 	}
 got_it:
 	if (PageUptodate(page)) {
+#ifdef CONFIG_F2FS_FS_VERITY
+		/* TODO(mhalcrow): Hack until I can figure out why a
+		 * zero page is being read in here */
+		if (f2fs_verity_file(inode) && !page->contents_hashed) {
+			ClearPageUptodate(page);
+		} else {
+			unlock_page(page);
+			return page;
+		}
+#else
 		unlock_page(page);
 		return page;
+#endif
 	}
 
 	/*
@@ -673,7 +720,7 @@ got_it:
 		return page;
 	}
 
-	err = f2fs_submit_page_read(inode, page, dn.data_blkaddr);
+	err = f2fs_submit_page_read(inode, page, dn.data_blkaddr, ctrl);
 	if (err)
 		goto put_err;
 	return page;
@@ -693,7 +740,7 @@ struct page *find_data_page(struct inode *inode, pgoff_t index)
 		return page;
 	f2fs_put_page(page, 0);
 
-	page = get_read_data_page(inode, index, 0, false);
+	page = get_read_data_page(inode, index, 0, false, NULL);
 	if (IS_ERR(page))
 		return page;
 
@@ -714,13 +761,13 @@ struct page *find_data_page(struct inode *inode, pgoff_t index)
  * whether this page exists or not.
  */
 struct page *get_lock_data_page(struct inode *inode, pgoff_t index,
-							bool for_write)
+				bool for_write, struct fsverity_bio_ctrl *ctrl)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct page *page;
 repeat:
-	page = get_read_data_page(inode, index, 0, for_write);
-	if (IS_ERR(page))
+	page = get_read_data_page(inode, index, 0, for_write, ctrl);
+	if (ctrl || IS_ERR(page))
 		return page;
 
 	/* wait for read completion */
@@ -784,7 +831,7 @@ struct page *get_new_data_page(struct inode *inode,
 
 		/* if ipage exists, blkaddr should be NEW_ADDR */
 		f2fs_bug_on(F2FS_I_SB(inode), ipage);
-		page = get_lock_data_page(inode, index, true);
+		page = get_lock_data_page(inode, index, true, NULL);
 		if (IS_ERR(page))
 			return page;
 	}
@@ -1068,10 +1115,12 @@ skip:
 		dn.ofs_in_node = end_offset;
 	}
 
-	if (pgofs >= end)
+	if (pgofs >= end) {
 		goto sync_out;
-	else if (dn.ofs_in_node < end_offset)
+	}
+	else if (dn.ofs_in_node < end_offset) {
 		goto next_block;
+	}
 
 	if (flag == F2FS_GET_BLOCK_PRECACHE) {
 		if (map->m_flags & F2FS_MAP_MAPPED) {
@@ -1335,9 +1384,10 @@ out:
  * This function was originally taken from fs/mpage.c, and customized for f2fs.
  * Major change was from block_size == page_size in f2fs by default.
  */
-static int f2fs_mpage_readpages(struct address_space *mapping,
-			struct list_head *pages, struct page *page,
-			unsigned nr_pages)
+static int __f2fs_mpage_readpages(struct address_space *mapping,
+				  struct list_head *pages, struct page *page,
+				  unsigned nr_pages,
+				  struct fsverity_bio_ctrl *ctrl)
 {
 	struct bio *bio = NULL;
 	sector_t last_block_in_bio = 0;
@@ -1373,7 +1423,7 @@ static int f2fs_mpage_readpages(struct address_space *mapping,
 		block_in_file = (sector_t)page->index;
 		last_block = block_in_file + nr_pages;
 		last_block_in_file = (i_size_read(inode) + blocksize - 1) >>
-								blkbits;
+			blkbits;
 		if (last_block > last_block_in_file)
 			last_block = last_block_in_file;
 
@@ -1382,8 +1432,9 @@ static int f2fs_mpage_readpages(struct address_space *mapping,
 		 */
 		if ((map.m_flags & F2FS_MAP_MAPPED) &&
 				block_in_file > map.m_lblk &&
-				block_in_file < (map.m_lblk + map.m_len))
+				block_in_file < (map.m_lblk + map.m_len)) {
 			goto got_it;
+		}
 
 		/*
 		 * Then do more f2fs_map_blocks() calls until we are
@@ -1396,18 +1447,33 @@ static int f2fs_mpage_readpages(struct address_space *mapping,
 			map.m_len = last_block - block_in_file;
 
 			if (f2fs_map_blocks(inode, &map, 0,
-						F2FS_GET_BLOCK_DEFAULT))
+						F2FS_GET_BLOCK_DEFAULT)) {
 				goto set_error_page;
+			}
 		}
 got_it:
 		if ((map.m_flags & F2FS_MAP_MAPPED)) {
 			block_nr = map.m_pblk + block_in_file - map.m_lblk;
 			SetPageMappedToDisk(page);
 
-			if (!PageUptodate(page) && !cleancache_get_page(page)) {
+			if (!PageUptodate(page) && cleancache_get_page(page)) {
 				SetPageUptodate(page);
 				goto confused;
 			}
+#ifdef CONFIG_F2FS_FS_VERITY
+			if (f2fs_verity_file(inode) &&
+			    fsverity_page_in_metadata_region(page)) {
+				/* TODO(mhalcrow): What's causing this
+				 * to be issued in the first place?
+				 * Readahead? Stop it at the
+				 * source. */
+				zero_user_segment(page, 0, PAGE_SIZE);
+				if (!PageUptodate(page))
+					SetPageUptodate(page);
+				unlock_page(page);
+				goto next_page;
+			}
+#endif
 		} else {
 			zero_user_segment(page, 0, PAGE_SIZE);
 			if (!PageUptodate(page))
@@ -1423,11 +1489,12 @@ got_it:
 		if (bio && (last_block_in_bio != block_nr - 1 ||
 			!__same_bdev(F2FS_I_SB(inode), block_nr, bio))) {
 submit_and_realloc:
-			__submit_bio(F2FS_I_SB(inode), bio, DATA);
+			__queue_or_submit_bio(inode, bio);
 			bio = NULL;
 		}
 		if (bio == NULL) {
-			bio = f2fs_grab_read_bio(inode, block_nr, nr_pages);
+			bio = f2fs_grab_read_bio(inode, block_nr, nr_pages,
+						 ctrl);
 			if (IS_ERR(bio)) {
 				bio = NULL;
 				goto set_error_page;
@@ -1446,7 +1513,7 @@ set_error_page:
 		goto next_page;
 confused:
 		if (bio) {
-			__submit_bio(F2FS_I_SB(inode), bio, DATA);
+			__queue_or_submit_bio(inode, bio);
 			bio = NULL;
 		}
 		unlock_page(page);
@@ -1456,9 +1523,72 @@ next_page:
 	}
 	BUG_ON(pages && !list_empty(pages));
 	if (bio)
-		__submit_bio(F2FS_I_SB(inode), bio, DATA);
+		__queue_or_submit_bio(inode, bio);
 	return 0;
 }
+
+#ifdef CONFIG_F2FS_FS_VERITY
+static int f2fs_mpage_readpages(struct address_space *mapping,
+			struct list_head *pages, struct page *page,
+			unsigned nr_pages)
+{
+	struct inode *inode = mapping->host;
+	struct fsverity_bio_ctrl *ctrl = NULL;
+	bool at_least_one_bio_submitted = false;
+	int err = 0;
+
+	if (f2fs_verity_file(inode)) {
+		struct bio *bio;
+
+		/* TODO(mhalcrow): Don't bother with the control
+		 * structure if the file size is <= PAGE_SIZE; we're
+		 * only going to measure the data page itself and
+		 * compare against the auth root hash. */
+		ctrl = fsverity_alloc_bio_ctrl(GFP_NOFS);
+		if (IS_ERR(ctrl))
+			return PTR_ERR(ctrl);
+		err = __f2fs_mpage_readpages(mapping, pages, page, nr_pages,
+					     ctrl);
+		if (err)
+			goto out_err;
+		if (i_size_read(inode) > PAGE_SIZE) {
+			err = fsverity_queue_auth_pages(inode, ctrl);
+			if (err)
+				goto out_err;
+		}
+		list_for_each_entry(bio, &ctrl->bio_group, bi_group) {
+			atomic_inc(&ctrl->nr_bios);
+			__submit_bio(F2FS_I_SB(inode), bio, DATA);
+			at_least_one_bio_submitted = true;
+		}
+		if (atomic_dec_and_test(&ctrl->nr_bios)) {
+			if (at_least_one_bio_submitted) {
+				bio = list_first_entry(&ctrl->bio_group,
+						       struct bio, bi_group);
+				fsverity_verify_bio(bio);
+			}
+		}
+		return 0;
+	} else {
+		return __f2fs_mpage_readpages(mapping, pages, page, nr_pages,
+					      NULL);
+	}
+out_err:
+	if (ctrl) {
+		/* TODO(mhalcrow): Make sure this frees bio_group
+		 * members for which submit failed */
+		fsverity_release_bio_ctrl(ctrl);
+	}
+	return err;
+}
+#else
+static int f2fs_mpage_readpages(struct address_space *mapping,
+			struct list_head *pages, struct page *page,
+			unsigned nr_pages)
+{
+	return __f2fs_mpage_readpages(mapping, pages, page, nr_pages, NULL);
+}
+#endif  /* CONFIG_F2FS_FS_VERITY */
 
 static int f2fs_read_data_page(struct file *file, struct page *page)
 {
@@ -2212,7 +2342,8 @@ repeat:
 		zero_user_segment(page, 0, PAGE_SIZE);
 		SetPageUptodate(page);
 	} else {
-		err = f2fs_submit_page_read(inode, page, blkaddr);
+		/* ctrl is NULL because fs-verity doesn't support writes */
+		err = f2fs_submit_page_read(inode, page, blkaddr, NULL);
 		if (err)
 			goto fail;
 

@@ -23,6 +23,7 @@
 #include <linux/uio.h>
 #include <linux/uuid.h>
 #include <linux/file.h>
+#include <linux/fsverity.h>
 
 #include "f2fs.h"
 #include "node.h"
@@ -111,7 +112,7 @@ mapped:
 	f2fs_wait_on_page_writeback(page, DATA, false);
 
 	/* wait for GCed encrypted page writeback */
-	if (f2fs_encrypted_file(inode))
+	if (f2fs_encrypted_file(inode) || f2fs_verity_file(inode))
 		f2fs_wait_on_block_writeback(sbi, dn.data_blkaddr);
 
 out_sem:
@@ -479,6 +480,20 @@ static int f2fs_file_open(struct inode *inode, struct file *filp)
 
 	if (err)
 		return err;
+
+#ifdef CONFIG_F2FS_FS_VERITY
+	if (f2fs_verity_file(inode)) {
+		int ret;
+
+		if (filp->f_mode & FMODE_WRITE)
+			return -EACCES;
+
+		ret = fsverity_get_info(inode);
+		if (ret)
+			return ret;
+	}
+#endif
+
 	return dquot_file_open(inode, filp);
 }
 
@@ -551,7 +566,7 @@ static int truncate_partial_data_page(struct inode *inode, u64 from,
 		return 0;
 	}
 
-	page = get_lock_data_page(inode, index, true);
+	page = get_lock_data_page(inode, index, true, NULL);
 	if (IS_ERR(page))
 		return PTR_ERR(page) == -ENOENT ? 0 : PTR_ERR(page);
 truncate_out:
@@ -702,6 +717,11 @@ int f2fs_getattr(const struct path *path, struct kstat *stat,
 				  STATX_ATTR_NODUMP);
 
 	generic_fillattr(inode, stat);
+
+#ifdef CONFIG_F2FS_FS_VERITY
+	if (f2fs_verity_file(inode))
+		stat->size = fsverity_i_size(inode);
+#endif
 
 	/* we need to show initial sectors used for inline_data/dentries */
 	if ((S_ISREG(inode->i_mode) && f2fs_has_inline_data(inode)) ||
@@ -1074,7 +1094,8 @@ static int __clone_blkaddrs(struct inode *src_inode, struct inode *dst_inode,
 		} else {
 			struct page *psrc, *pdst;
 
-			psrc = get_lock_data_page(src_inode, src + i, true);
+			psrc = get_lock_data_page(src_inode, src + i, true,
+						  NULL);
 			if (IS_ERR(psrc))
 				return PTR_ERR(psrc);
 			pdst = get_new_data_page(dst_inode, NULL, dst + i,
@@ -1494,6 +1515,9 @@ static long f2fs_fallocate(struct file *file, int mode,
 	/* f2fs only support ->fallocate for regular file */
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
+
+	if (f2fs_verity_file(inode))
+		return -EOPNOTSUPP;
 
 	if (f2fs_encrypted_inode(inode) &&
 		(mode & (FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE)))
@@ -2199,7 +2223,7 @@ do_map:
 		while (idx < map.m_lblk + map.m_len && cnt < blk_per_seg) {
 			struct page *page;
 
-			page = get_lock_data_page(inode, idx, true);
+			page = get_lock_data_page(inode, idx, true, NULL);
 			if (IS_ERR(page)) {
 				err = PTR_ERR(page);
 				goto clear_out;
@@ -2814,6 +2838,50 @@ static int f2fs_ioc_precache_extents(struct file *filp, unsigned long arg)
 	return f2fs_precache_extents(file_inode(filp));
 }
 
+#define FS_VERITY_ROOT_HASH_SIZE 64
+
+static int f2fs_ioc_measure_fsverity(struct file *filp, unsigned long arg)
+{
+	struct inode *inode = file_inode(filp);
+	struct fsverity_root_hash root_hash;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	if (copy_from_user(&root_hash, (struct fsverity_root_hash __user *)arg,
+			   sizeof(root_hash)))
+		return -EFAULT;
+
+	if (!f2fs_verity_file(inode))
+		return -EINVAL;
+
+	return fsverity_measure_info(inode, &root_hash);
+}
+
+static int f2fs_ioc_set_fsverity(struct file *filp, unsigned long arg)
+{
+	struct inode *inode = file_inode(filp);
+	struct fsverity_set set;
+
+	if (!f2fs_sb_has_verity(inode->i_sb))
+		return -EOPNOTSUPP;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	if (f2fs_verity_file(inode))
+		return -EINVAL;
+
+	if (copy_from_user(&set, (struct fsverity_set __user *)arg,
+			   sizeof(set))) {
+		return -EFAULT;
+	}
+
+	f2fs_update_time(F2FS_I_SB(inode), REQ_TIME);
+
+	return fsverity_enable(inode, &set);
+}
+
 long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	if (unlikely(f2fs_cp_error(F2FS_I_SB(file_inode(filp)))))
@@ -2870,6 +2938,10 @@ long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return f2fs_ioc_set_pin_file(filp, arg);
 	case F2FS_IOC_PRECACHE_EXTENTS:
 		return f2fs_ioc_precache_extents(filp, arg);
+	case FS_IOC_MEASURE_FSVERITY:
+		return f2fs_ioc_measure_fsverity(filp, arg);
+	case FS_IOC_SET_FSVERITY:
+		return f2fs_ioc_set_fsverity(filp, arg);
 	default:
 		return -ENOTTY;
 	}
@@ -2948,6 +3020,8 @@ long f2fs_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case F2FS_IOC_GET_PIN_FILE:
 	case F2FS_IOC_SET_PIN_FILE:
 	case F2FS_IOC_PRECACHE_EXTENTS:
+	case FS_IOC_GET_FSVERITY:
+	case FS_IOC_SET_FSVERITY:
 		break;
 	default:
 		return -ENOIOCTLCMD;
