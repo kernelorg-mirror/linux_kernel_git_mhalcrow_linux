@@ -79,11 +79,19 @@ static void f2fs_read_end_io(struct bio *bio)
 			/* TODO(mhalcrow) */
 			fsverity_release_bio_ctrl(bio->bi_verity_ctrl);
 		} else {
+#ifdef CONFIG_FS_VERITY_DEBUG
+			printk(KERN_WARNING "%s: Calling verify_bio w/ bio = "
+			       "[0x%p]\n", __func__, bio);
+#endif
 			fsverity_verify_bio(bio);
 			return;
 		}
 	}
 
+#ifdef CONFIG_FS_VERITY_DEBUG
+	printk(KERN_WARNING "%s: bio [0x%p] isn't encrypted or veritied; "
+	       "completing pages\n", __func__, bio);
+#endif
 	bio_for_each_segment_all(bvec, bio, i) {
 		struct page *page = bvec->bv_page;
 
@@ -510,8 +518,13 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 	bio->bi_end_io = f2fs_read_end_io;
 	bio->bi_private = ctx;
 #ifdef CONFIG_F2FS_FS_VERITY
-	if (f2fs_verity_file(inode))
+	if (f2fs_verity_file(inode)) {
 		bio->bi_verity_ctrl = ctrl;
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING "%s: Setting ctrl [0x%p] on bio [0x%p]\n",
+		       __func__, ctrl, bio);
+#endif  /* CONFIG_FS_VERITY_DEBUG */
+	}
 #endif  /* CONFIG_F2FS_FS_VERITY */
 	bio_set_op_attrs(bio, REQ_OP_READ, 0);
 
@@ -521,10 +534,15 @@ static struct bio *f2fs_grab_read_bio(struct inode *inode, block_t blkaddr,
 #ifdef CONFIG_F2FS_FS_VERITY
 static void __queue_or_submit_bio(struct inode *inode, struct bio *bio)
 {
-	if (f2fs_verity_file(inode) && bio->bi_verity_ctrl)
+	if (f2fs_verity_file(inode) && bio->bi_verity_ctrl) {
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING "%s: Queuing bio [0x%p] for submit\n",
+		       __func__, bio);
+#endif  /* CONFIG_FS_VERITY_DEBUG */
 		list_add_tail(&bio->bi_group, &bio->bi_verity_ctrl->bio_group);
-	else
+	} else {
 		__submit_bio(F2FS_I_SB(inode), bio, DATA);
+	}
 }
 #else
 static void __queue_or_submit_bio(struct inode *inode, struct bio *bio)
@@ -547,6 +565,12 @@ static int f2fs_submit_page_read(struct inode *inode, struct page *page,
 		bio_put(bio);
 		return -EFAULT;
 	}
+#ifdef CONFIG_FS_VERITY_DEBUG
+	if (f2fs_verity_file(inode)) {
+		printk(KERN_WARNING "%s: Queue-or-submit bio [0x%p] for "
+		       "page in verity; ctrl = [0x%p]\n", __func__, bio, ctrl);
+	}
+#endif
 	__queue_or_submit_bio(inode, bio);
 	return 0;
 }
@@ -670,10 +694,17 @@ struct page *get_read_data_page(struct inode *inode, pgoff_t index,
 	struct extent_info ei = {0,0,0};
 	int err;
 
+#ifdef CONFIG_FS_VERITY_DEBUG
+	printk(KERN_WARNING "%s: Called w/ index = [%lu]\n", __func__, index);
+#endif
 	page = f2fs_grab_cache_page(mapping, index, for_write);
 	if (!page)
 		return ERR_PTR(-ENOMEM);
 
+#ifdef CONFIG_FS_VERITY_DEBUG
+	printk(KERN_WARNING "%s: Page [0x%p] successfully grabbed in the "
+	       "cache\n", __func__, page);
+#endif
 	if (f2fs_lookup_extent_cache(inode, index, &ei)) {
 		dn.data_blkaddr = ei.blk + index - ei.fofs;
 		goto got_it;
@@ -691,6 +722,10 @@ struct page *get_read_data_page(struct inode *inode, pgoff_t index,
 	}
 got_it:
 	if (PageUptodate(page)) {
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING "%s: Page [0x%p] is up to date\n",
+		       __func__, page);
+#endif
 #ifdef CONFIG_F2FS_FS_VERITY
 		/* TODO(mhalcrow): Hack until I can figure out why a
 		 * zero page is being read in here */
@@ -713,6 +748,13 @@ got_it:
 	 * see, f2fs_add_link -> get_new_data_page -> init_inode_metadata.
 	 */
 	if (dn.data_blkaddr == NEW_ADDR) {
+#ifdef CONFIG_FS_VERITY_DEBUG
+		if (f2fs_verity_file(inode)) {
+			printk(KERN_WARNING "%s: Page with index [%lu] is "
+			       "NEW_ADDR; zeroing and setting up to date\n",
+			       __func__, page->index);
+		}
+#endif
 		zero_user_segment(page, 0, PAGE_SIZE);
 		if (!PageUptodate(page))
 			SetPageUptodate(page);
@@ -720,6 +762,13 @@ got_it:
 		return page;
 	}
 
+#ifdef CONFIG_FS_VERITY_DEBUG
+	if (f2fs_verity_file(inode)) {
+		printk(KERN_WARNING "%s: Calling f2fs_submit_page_read() for "
+		       "page->index [%lu] and dn.data_blkaddr = [%u]\n",
+		       __func__, page->index, dn.data_blkaddr);
+	}
+#endif
 	err = f2fs_submit_page_read(inode, page, dn.data_blkaddr, ctrl);
 	if (err)
 		goto put_err;
@@ -766,6 +815,12 @@ struct page *get_lock_data_page(struct inode *inode, pgoff_t index,
 	struct address_space *mapping = inode->i_mapping;
 	struct page *page;
 repeat:
+#ifdef CONFIG_FS_VERITY_DEBUG
+	if (f2fs_verity_file(inode)) {
+		printk(KERN_WARNING "%s: Calling get_read_data_page for "
+		       "index [%lu]\n", __func__, index);
+	}
+#endif
 	page = get_read_data_page(inode, index, 0, for_write, ctrl);
 	if (ctrl || IS_ERR(page))
 		return page;
@@ -1031,6 +1086,12 @@ next_block:
 	blkaddr = datablock_addr(dn.inode, dn.node_page, dn.ofs_in_node);
 
 	if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR) {
+#ifdef CONFIG_FS_VERITY_DEBUG
+		if (blkaddr == NEW_ADDR) {
+			printk(KERN_WARNING "%s: blkaddr == NEW_ADDR\n",
+			       __func__);
+		}
+#endif
 		if (create) {
 			if (unlikely(f2fs_cp_error(sbi))) {
 				err = -EIO;
@@ -1419,6 +1480,12 @@ static int __f2fs_mpage_readpages(struct address_space *mapping,
 						  readahead_gfp_mask(mapping)))
 				goto next_page;
 		}
+#ifdef CONFIG_FS_VERITY_DEBUG
+		else {
+			printk(KERN_WARNING "%s: !pages; mapping single page\n",
+			       __func__);
+		}
+#endif
 
 		block_in_file = (sector_t)page->index;
 		last_block = block_in_file + nr_pages;
@@ -1445,21 +1512,50 @@ static int __f2fs_mpage_readpages(struct address_space *mapping,
 		if (block_in_file < last_block) {
 			map.m_lblk = block_in_file;
 			map.m_len = last_block - block_in_file;
+#ifdef CONFIG_FS_VERITY_DEBUG
+			printk(KERN_WARNING "%s: Mapping page w/ map.m_lblk = "
+			       "[%d] and map.m_len = [%d]\n",
+			       __func__, map.m_lblk, map.m_len);
+#endif
 
 			if (f2fs_map_blocks(inode, &map, 0,
 						F2FS_GET_BLOCK_DEFAULT)) {
+#ifdef CONFIG_FS_VERITY_DEBUG
+				printk(KERN_WARNING "%s: Error mapping page\n",
+				       __func__);
+#endif
 				goto set_error_page;
 			}
 		}
+#ifdef CONFIG_FS_VERITY_DEBUG
+		else {
+			printk(KERN_WARNING "%s: Not mapping; block_in_file = [%lu]; last_block = [%lu]; map.m_lblk = [%u]; map.m_len = [%u]\n", __func__, block_in_file, last_block, map.m_lblk, map.m_len);
+		}
+#endif
 got_it:
 		if ((map.m_flags & F2FS_MAP_MAPPED)) {
 			block_nr = map.m_pblk + block_in_file - map.m_lblk;
 			SetPageMappedToDisk(page);
 
+#ifdef CONFIG_FS_VERITY_DEBUG
+			{
+				int cc_res = cleancache_get_page(page);
+				if (!PageUptodate(page) && !cc_res) {
+					printk(KERN_WARNING "%s: !PageUptodate("
+					       "page=[0x%p]); "
+					       "cleancache_get_page() "
+					       "returned [%d]\n", __func__,
+					       page, cc_res);
+					SetPageUptodate(page);
+					goto confused;
+				}
+			}
+#else
 			if (!PageUptodate(page) && cleancache_get_page(page)) {
 				SetPageUptodate(page);
 				goto confused;
 			}
+#endif
 #ifdef CONFIG_F2FS_FS_VERITY
 			if (f2fs_verity_file(inode) &&
 			    fsverity_page_in_metadata_region(page)) {
@@ -1467,6 +1563,12 @@ got_it:
 				 * to be issued in the first place?
 				 * Readahead? Stop it at the
 				 * source. */
+#ifdef CONFIG_FS_VERITY_DEBUG
+				printk(KERN_WARNING "%s: Page with index "
+				       "[%lu] is in fsverity "
+				       "metadata region; skipping\n", __func__,
+					page->index);
+#endif
 				zero_user_segment(page, 0, PAGE_SIZE);
 				if (!PageUptodate(page))
 					SetPageUptodate(page);
@@ -1475,6 +1577,10 @@ got_it:
 			}
 #endif
 		} else {
+#ifdef CONFIG_FS_VERITY_DEBUG
+			printk(KERN_WARNING "%s: Page not mapped; zeroing "
+			       "page and unlocking\n", __func__);
+#endif
 			zero_user_segment(page, 0, PAGE_SIZE);
 			if (!PageUptodate(page))
 				SetPageUptodate(page);
@@ -1501,6 +1607,11 @@ submit_and_realloc:
 			}
 		}
 
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING "%s: Adding page = [0x%p]) with index "
+		       "[%lu] to bio = [0x%p]\n", __func__, page, page->index,
+		       bio);
+#endif
 		if (bio_add_page(bio, page, blocksize, 0) < blocksize)
 			goto submit_and_realloc;
 
@@ -1516,6 +1627,10 @@ confused:
 			__queue_or_submit_bio(inode, bio);
 			bio = NULL;
 		}
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING "%s: Confused about page [0x%p]\n",
+		       __func__, page);
+#endif
 		unlock_page(page);
 next_page:
 		if (pages)
@@ -1547,6 +1662,10 @@ static int f2fs_mpage_readpages(struct address_space *mapping,
 		ctrl = fsverity_alloc_bio_ctrl(GFP_NOFS);
 		if (IS_ERR(ctrl))
 			return PTR_ERR(ctrl);
+#ifdef CONFIG_FS_VERITY_DEBUG
+		printk(KERN_WARNING "%s: Allocated ctrl [0x%p]\n",
+		       __func__, ctrl);
+#endif
 		err = __f2fs_mpage_readpages(mapping, pages, page, nr_pages,
 					     ctrl);
 		if (err)
@@ -1558,10 +1677,26 @@ static int f2fs_mpage_readpages(struct address_space *mapping,
 		}
 		list_for_each_entry(bio, &ctrl->bio_group, bi_group) {
 			atomic_inc(&ctrl->nr_bios);
+#ifdef CONFIG_FS_VERITY_DEBUG
+			{
+				unsigned nr_bios = atomic_read(&ctrl->nr_bios);
+
+				printk(KERN_WARNING "%s: Submitting bio "
+				       "[0x%p] with ctrl [0x%p] that has "
+				       "nr_bios = [%d]\n",
+				       __func__, bio, ctrl, nr_bios);
+			}
+#endif
 			__submit_bio(F2FS_I_SB(inode), bio, DATA);
 			at_least_one_bio_submitted = true;
 		}
 		if (atomic_dec_and_test(&ctrl->nr_bios)) {
+#ifdef CONFIG_FS_VERITY_DEBUG
+			printk(KERN_WARNING "%s: All bios in bio_group "
+			       "completed before the submit path finalized. "
+			       "Doing bio_group completion in the submit "
+			       "path.\n", __func__);
+#endif
 			if (at_least_one_bio_submitted) {
 				bio = list_first_entry(&ctrl->bio_group,
 						       struct bio, bi_group);
