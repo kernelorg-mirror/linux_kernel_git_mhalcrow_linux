@@ -9,3 +9,9 @@ config FS_VERITY
 	  filesystem checks data blocks' authenticity when reading
 	  them from underlying disk, similar to how dm-verity does
 	  this when reading from a block device.
+
+config FS_VERITY_DEBUG
+	bool "FS Verity Debug"
+	select FS_VERITY
+	help
+	  Debug FS Verity
