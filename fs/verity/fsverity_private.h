@@ -63,6 +63,36 @@ struct fsverity_extension {
 	__le16 reserved;	/* Reserved, must be 0 */
 } __packed;
 
+/* On-disk format */
+struct fsverity_extension_elide {
+	__le64 offset;
+	__le64 length;
+} __packed;
+
+/* In-kernel struct */
+struct fsverity_elision {
+	struct list_head link;
+	pgoff_t index;
+	pgoff_t nr_pages;
+};
+
+/* On-disk format */
+struct fsverity_extension_patch {
+	__le64 offset;
+	u8 databytes[];
+} __packed;
+
+#define FS_VERITY_MAX_PATCH_SIZE 255
+
+/* In-kernel struct */
+struct fsverity_patch {
+	struct list_head link;
+	pgoff_t index;
+	unsigned int offset;
+	unsigned int length;
+	u8 patch[];
+};
+
 /*
  * Up to 64 levels are theoretically possible with a very small block size, but
  * we'd like to limit stack usage, and in practice this is plenty.  E.g., with
@@ -107,12 +137,17 @@ struct fsverity_info {
 	enum fsverity_mode mode;	/* current mode of the file */
 	u8 salt[FS_VERITY_SALT_SIZE];	/* used to salt the hashes */
 	u64 data_i_size;		/* original file size */
+	u64 elided_i_size;		/* original file size after elisions */
 	u64 full_i_size;		/* full file size including metadata */
 	u8 root_hash[FS_VERITY_MAX_DIGEST_SIZE];   /* Merkle tree root hash */
 	u8 measurement[FS_VERITY_MAX_DIGEST_SIZE]; /* file measurement */
 
 	/* Starting blocks for each tree level. 'depth-1' is the root level. */
 	u64 hash_lvl_region_idx[FS_VERITY_MAX_LEVELS];
+
+	/* Optional elide and patch extensions, sorted by increasing offset */
+	struct list_head elisions;
+	struct list_head patches;
 };
 
 #endif /* _FSVERITY_PRIVATE_H */
